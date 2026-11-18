@@ -15,21 +15,22 @@ paper money. Long only, at most one open position, full-size entries.
 
 The bot must not sit idle. Two doors share the single position:
 
-- **Mean-reversion door** (sideways tape): the close has fallen ≥180 bps
-  below the trailing 60-bar high, RSI(14) ≤ 38, the bar bounced off its low
-  and lifted ≥15 bps off the trailing 30-bar low. A second trigger fires when
-  RSI ≤ 35 and the close sits under the lower Bollinger band (20, 2σ).
-  Exits: +150 bps take-profit, −80 bps stop-loss, trailing give-back
-  (arm +80, give 50), 360-bar time stop, or RSI ≥ 72 (bounce spent).
-- **Trend door** (trending tape): EMA 9 > EMA 21 > EMA 50 with EMA 50
-  rising, a 20-bar high breakout on a bar gaining ≥10 bps, RSI ≤ 68.
-  Exits: +200 bps take-profit, −100 bps stop-loss, trailing give-back
-  (arm +100, give 60), 360-bar time stop, or EMA 9 crossing back under
-  EMA 21 (trend broken).
+- **Mean-reversion door**: the close has fallen ≥180 bps below the trailing
+  60-bar high (ATR-adjusted: 150 bps on a cold tape, 240 bps on a hot one),
+  RSI(14) ≤ 38, and the bar bounced. There is deliberately no lift filter:
+  at the bottom of a grinding drop the close *is* the trailing low, so a
+  lift requirement and a dip requirement can almost never both hold. The
+  bounce it buys is short, so it exits fast: +90 bps take-profit, −60 bps
+  stop-loss, trailing give-back (arm +60, give 30), 60-bar time stop, or
+  RSI ≥ 70.
+- **Trend door**: EMA 9 > EMA 21 > EMA 50 with EMA 50 rising, a 20-bar high
+  breakout on a bar gaining ≥10 bps (ATR-adjusted), RSI ≤ 65 so a breakout
+  that is already hot is not chased. Exits: +90 bps take-profit, −80 bps
+  stop-loss, trailing give-back (arm +80, give 40), 90-bar time stop, or
+  EMA 9 crossing back under EMA 21.
 - **ATR intelligence**: ATR(14) in bps stretches the dip / breakout bars on
-  a hot tape (≥90 bps) and relaxes them on a cold tape (≤25 bps), and widens
-  the stop the position size is risked against — a wild hour cannot force a
-  full-size entry on a noise dip.
+  a hot tape and relaxes them on a cold tape, and widens the stop the
+  position size is risked against.
 - **Risk sizing**: each trade risks ~1% of equity (stop distance); size is
   capped by cash and the weight room, so entries are effectively full-size
   with normal stops and shrink automatically when ATR widens the stop.
@@ -39,8 +40,24 @@ The bot must not sit idle. Two doors share the single position:
 After any exit the bot waits 12 bars before a new entry, and takes no new
 entry in the last stretch of the window.
 
+A Bollinger lower-band variant was built, measured and removed: on 1-minute
+bars its forward edge (+16 bps mean at 30 bars) sits below the ~26 bps
+round-trip cost, and on the dev tape its 8 trades net about −$21.
+
 Everything is a pure function of the bars: no clock, no environment, no
 randomness — two executions on the same data give the same orders.
+
+## Measured results (official dev window, kit grade-local)
+
+- **HYBRID-1444: net PnL +$11.07, 3 round trips (6 trades), max drawdown
+  0.82%** — passes the dev gate (>$0).
+- Baselines on the same window: buy-and-hold −$31.63, momentum −$23.87,
+  rsi-bollinger −$39.92, adx-momentum −$75.57, ema-cross −$148.17.
+- Robustness check on Binance BTCUSDT 1m, Nov 9–16 2026 (a −13.9% week;
+  buy-and-hold −$138.93 over the 8 days): this bot −$114.03, 0/8 positive
+  days — it loses less than holding, but it does lose in a grinding
+  downtrend, as any long-only bot does. Reported plainly; the dev gate is
+  what decides whether it races.
 
 ## Layout
 

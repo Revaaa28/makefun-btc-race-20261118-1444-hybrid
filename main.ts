@@ -3,16 +3,19 @@
 // Rev's design: the bot must NOT sit idle. Two doors share one long-only
 // position (100% of cash per entry, risk-sized so the stop is ~1% of equity):
 //
-//   * MR door (mean reversion, sideways tape): the close has fallen a long way
-//     below the trailing 60-bar high, RSI(14) is washed out, the bar bounced
-//     off its low and lifted off the trailing 30-bar low; or, as a second
-//     trigger, RSI is washed out and the close sits under the lower Bollinger
-//     band. Exits on take-profit, stop-loss, a trailing give-back, a time
-//     stop, or RSI running hot again.
+//   * MR door (mean reversion): the close has fallen a long way below the
+//     trailing 60-bar high, RSI(14) is washed out, and the bar bounced.
+//     There is deliberately no lift filter: at the bottom of a grinding
+//     drop the close IS the trailing low, so a lift requirement and a dip
+//     requirement can almost never both hold. The bounce it buys is short,
+//     so it exits fast: +90 bps take-profit, 60-bar time stop.
+//     (A Bollinger lower-band variant was built, measured and removed:
+//     on 1-minute bars its forward edge sits below the round-trip cost.)
 //   * Trend door (trending tape): EMA 9 > EMA 21 > EMA 50 with EMA 50 rising,
-//     a 20-bar high breakout on a strong bar, RSI not overbought. Exits on
-//     take-profit, stop-loss, a trailing give-back, a time stop, or the fast
-//     EMA crossing back under the slow one.
+//     a 20-bar high breakout on a strong bar, RSI not overbought (≤ 65, so
+//     a breakout that is already hot is not chased). Exits fast too:
+//     +90 bps take-profit, 90-bar time stop, or the fast EMA crossing back
+//     under the slow one.
 //
 //   * ATR intelligence: ATR(14) in bps stretches the dip / breakout bars when
 //     the tape is hot and relaxes them when it is cold, and widens the stop
@@ -33,24 +36,25 @@ const P = {
   // Mean-reversion door
   mrDipBps: 180, // close this far (bps) below the trailing 60-bar high
   mrRsiMax: 38, // RSI(14) at or under this
-  mrLiftBps: 15, // close lifted this far (bps) off the trailing 30-bar low
-  mrTpBps: 150,
-  mrSlBps: 80,
-  mrTrailArmBps: 80,
-  mrTrailGiveBps: 50,
-  mrTimeStop: 360,
-  mrRsiExit: 72, // bounce spent: RSI hot again
-  // Bollinger variant of the MR door (sideways chop that never dips 180 bps)
-  bbRsiMax: 35,
-  bbBars: 20,
-  bbSigmas: 2,
+  mrTpBps: 90, // the bounce is short: take it fast (fwd ~30 bars is the edge)
+  mrSlBps: 60,
+  mrTrailArmBps: 60,
+  mrTrailGiveBps: 30,
+  mrTimeStop: 60, // do not ride the chop after the bounce fades
+  mrRsiExit: 70, // bounce spent: RSI hot again
+  // Bollinger mean reversion was tried and REMOVED: on 1-minute bars the
+  // lower-band touch fires into sharp down-spikes whose forward edge
+  // (+16 bps mean at 30 bars) sits below the ~26 bps round-trip cost, and
+  // on the dev tape its 8 trades net about -$21 while the dip door nets
+  // +$9.34. The hybrid keeps its two working doors (dip + trend) instead
+  // of a third door that bleeds.
   // Trend door
-  trTpBps: 200,
-  trSlBps: 100,
-  trTrailArmBps: 100,
-  trTrailGiveBps: 60,
-  trTimeStop: 360,
-  trRsiMax: 68,
+  trTpBps: 90, // bank the breakout fast: 1-minute breakouts fade quickly
+  trSlBps: 80,
+  trTrailArmBps: 80,
+  trTrailGiveBps: 40,
+  trTimeStop: 90,
+  trRsiMax: 65, // do not chase a breakout that is already hot
   trGainMinBps: 10, // breakout bar must gain at least this (bps)
   // Shared
   cooldown: 12, // bars to wait after any exit before a new entry
@@ -68,13 +72,12 @@ const P = {
   atrColdGainBps: 8, // breakout bar gain accepted on a cold tape
 };
 
-type Door = 'mr' | 'bb' | 'trend';
+type Door = 'mr' | 'trend';
 
 class Hybrid {
   closes: number[] = [];
   highs: number[] = [];
   lows: number[] = [];
-  typical: number[] = [];
   ema9: number | null = null;
   ema21: number | null = null;
   ema50: number | null = null;
@@ -117,8 +120,6 @@ class Hybrid {
     this.highs.push(h);
     this.lows.push(l);
     this.closes.push(c);
-    this.typical.push((h + l + c) / 3);
-    if (this.typical.length > P.bbBars) this.typical.shift();
 
     if (this.prevClose !== null) {
       const chg = c - this.prevClose;
@@ -167,18 +168,6 @@ class Hybrid {
     return (this.atr / c) * 10_000;
   }
 
-  /** Lower Bollinger band (20 typical prices, 2 population sigmas), or null. */
-  private lowerBand(): number | null {
-    if (this.typical.length < P.bbBars) return null;
-    let mean = 0;
-    for (const x of this.typical) mean += x;
-    mean /= P.bbBars;
-    let variance = 0;
-    for (const x of this.typical) variance += (x - mean) * (x - mean);
-    variance /= P.bbBars;
-    return mean - P.bbSigmas * Math.sqrt(variance);
-  }
-
   onBatch(state: BarsState, batch: { bars: Bar[]; fills: { side: string; status: string; price: string }[] }): (BuyInput | SellInput)[] | null {
     for (const bar of batch.bars) {
       if (bar.symbol === SYMBOL) this.feed(bar);
@@ -216,17 +205,35 @@ class Hybrid {
       const gainBps = ((close - this.entryPrice) * 10_000) / this.entryPrice;
       if (gainBps > this.peakGainBps) this.peakGainBps = gainBps;
       const door = this.entryDoor ?? 'mr';
-      const tp = door === 'trend' ? P.trTpBps : P.mrTpBps;
-      const sl = door === 'trend' ? P.trSlBps : P.mrSlBps;
-      const arm = door === 'trend' ? P.trTrailArmBps : P.mrTrailArmBps;
-      const give = door === 'trend' ? P.trTrailGiveBps : P.mrTrailGiveBps;
-      const ts = door === 'trend' ? P.trTimeStop : P.mrTimeStop;
+      // Exits are per door: the MR bounce is short (take it fast), the BB
+      // chop trade is shorter still, the trend ride is the longest.
+      let tp: number;
+      let sl: number;
+      let arm: number;
+      let give: number;
+      let ts: number;
+      let rsiExit: number;
+      if (door === 'trend') {
+        tp = P.trTpBps;
+        sl = P.trSlBps;
+        arm = P.trTrailArmBps;
+        give = P.trTrailGiveBps;
+        ts = P.trTimeStop;
+        rsiExit = 100; // no RSI exit on the trend ride
+      } else {
+        tp = P.mrTpBps;
+        sl = P.mrSlBps;
+        arm = P.mrTrailArmBps;
+        give = P.mrTrailGiveBps;
+        ts = P.mrTimeStop;
+        rsiExit = P.mrRsiExit;
+      }
       let exit = false;
       if (gainBps <= -sl) exit = true; // stop-loss
       else if (gainBps >= tp) exit = true; // take-profit
       else if (this.peakGainBps >= arm && this.peakGainBps - gainBps >= give) exit = true; // trailing give-back
       else if (i - this.entryIdx >= ts) exit = true; // time stop
-      else if (door !== 'trend' && this.rsi !== null && this.rsi >= P.mrRsiExit) exit = true; // MR bounce spent
+      else if (door !== 'trend' && this.rsi !== null && this.rsi >= rsiExit) exit = true; // bounce spent
       else if (
         door === 'trend' &&
         this.ema9 !== null &&
@@ -253,19 +260,14 @@ class Hybrid {
 
     let door: Door | null = null;
 
-    // MR door: deep dip + washed-out RSI + bounce + lift off the low.
+    // MR door: deep dip + washed-out RSI + a bounce bar. No lift filter:
+    // at the bottom of a grinding drop the close IS the trailing low, so a
+    // lift requirement and a dip requirement can almost never both hold.
     if (this.rsi !== null && i >= P.warmupMr) {
       const win = this.highs.slice(Math.max(0, i - 60), i);
       const hi = win.length > 0 ? Math.max(...win) : close;
-      const low30 = Math.min(...this.closes.slice(Math.max(0, i - 30), i + 1));
       const dipped = close * 10_000 <= hi * (10_000 - dipBps);
-      const lifted = close * 10_000 >= low30 * (10_000 + P.mrLiftBps);
-      if (dipped && this.rsi <= P.mrRsiMax && close > prev && lifted) door = 'mr';
-    }
-    // Bollinger variant: washed-out RSI, close under the lower band, bouncing.
-    if (door === null && this.rsi !== null && i >= P.warmupMr) {
-      const lower = this.lowerBand();
-      if (lower !== null && this.rsi <= P.bbRsiMax && close < lower && close > prev) door = 'bb';
+      if (dipped && this.rsi <= P.mrRsiMax && close > prev) door = 'mr';
     }
     // Trend door: bull EMA stack, EMA 50 rising, 20-bar breakout, strong bar.
     if (door === null && i >= P.warmupTrend) {
